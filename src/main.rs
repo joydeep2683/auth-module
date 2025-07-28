@@ -4,8 +4,6 @@ use env_logger::Env;
 use std::env;
 use serde::{Serialize, Deserialize};
 
-use redis::AsyncCommands;
-
 mod redis_client;
 use redis_client::init_redis_pool;
 use redis_client::RedisPool;
@@ -17,7 +15,6 @@ use utils::common::generate_random_number;
 struct OtpResponse {
     phone: String,
     status: String,
-    otp: u16,
 }
 
 #[derive(Deserialize)]
@@ -34,18 +31,35 @@ async fn hello() -> impl Responder {
 #[get("/get-otp")]
 async fn get_otp(query: web::Query<OtpQuery>, redis: web::Data<RedisPool>) -> impl Responder {
     let result = generate_random_number((1000, 9999));
-    let phone = query.phone.to_string();
+    // log the otp generation instead of printing
+    println!("🔑 OTP generated for phone {}: {}", query.phone, result);
+    let phone_number = query.phone.to_string();
     //Store OTP in redis with 5 mins expiry
-    {
+    let redis_result = {
         let mut conn = redis.lock().await;
-        let _: () = conn.set_ex(phone.clone(), result, 300).await.unwrap();
-    }
-    let response = OtpResponse {
-        phone: phone,
-        status: "success".to_string(),
-        otp: result
+        redis::cmd("SETEX")
+            .arg(&phone_number)
+            .arg(300) // 5 minutes in seconds
+            .arg(result.to_string())
+            .query_async::<_, ()>(&mut *conn)
+            .await
     };
-    HttpResponse::Ok().json(response)
+
+    match redis_result {
+        Ok(_) => {
+            let response = OtpResponse {
+                phone: phone_number,
+                status: "success".to_string()
+            };
+            HttpResponse::Ok().json(response)
+        }
+        Err(e) => {
+            eprintln!("❌ Redis error: {:?}", e);
+            HttpResponse::InternalServerError().body("Failed to store OTP")
+        }
+    }
+    
+    
 }
 
 #[actix_web::main]
