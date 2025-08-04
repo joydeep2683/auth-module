@@ -1,55 +1,91 @@
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use actix_web::{get, middleware::Logger, web, App, HttpResponse, HttpServer, Responder};
 
-const OTP_LENGTH: usize = 4; // Length of the OTP
-const USER_ID_LENGTH: usize = 10; // Length of the user ID
+use env_logger::Env;
+use std::env;
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug)]
-struct User {
-    phone_no: String,
-    id: String,
+mod redis_client;
+use redis_client::init_redis_pool;
+use redis_client::RedisPool;
+
+mod utils;
+use utils::common::generate_random_number;
+
+#[derive(Serialize)]
+struct OtpResponse {
+    phone: String,
+    status: String,
 }
 
-static USERS: Lazy<Mutex<Vec<User>>> = Lazy::new(|| Mutex::new(Vec::new()));
-static OTP_ENTRIES: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| {
-    Mutex::new(HashMap::new())
-});
-
-fn generate_otp(phone_no: &str) {
-    let otp = generate_unique_id(OTP_LENGTH);
-    let mut entries = OTP_ENTRIES.lock().unwrap();
-    entries.insert(phone_no.to_string(), otp.to_string());
-    println!("OTP Entries: {:?}", *entries);
+#[derive(Deserialize)]
+pub struct OtpQuery {
+    phone: String
 }
 
-fn add_user(phone_no: &str) {
-    let id: String = generate_unique_id(USER_ID_LENGTH);
-    let mut users = USERS.lock().unwrap();
-    users.push(User { phone_no: phone_no.to_string(), id });
-    println!("User Entries: {:?}", *users);
+#[get("/")]
+async fn hello() -> impl Responder {
+    println!("Received request to /");
+    HttpResponse::Ok().body("Hello from Actix!")
 }
 
-fn generate_unique_id(length: usize) -> String {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
-    let mut id = format!("{}", duration.as_nanos());
-    if id.len() > length {
-        id = id[0..length].to_string();
+#[get("/get-otp")]
+async fn get_otp(query: web::Query<OtpQuery>, redis: web::Data<RedisPool>) -> impl Responder {
+    let result = generate_random_number((1000, 9999));
+    // log the otp generation instead of printing
+    println!("🔑 OTP generated for phone {}: {}", query.phone, result);
+    let phone_number = query.phone.to_string();
+    //Store OTP in redis with 5 mins expiry
+    let redis_result = {
+        let mut conn = redis.lock().await;
+        redis::cmd("SETEX")
+            .arg(&phone_number)
+            .arg(300) // 5 minutes in seconds
+            .arg(result.to_string())
+            .query_async::<_, ()>(&mut *conn)
+            .await
+    };
+
+    match redis_result {
+        Ok(_) => {
+            let response = OtpResponse {
+                phone: phone_number,
+                status: "success".to_string()
+            };
+            HttpResponse::Ok().json(response)
+        }
+        Err(e) => {
+            eprintln!("❌ Redis error: {:?}", e);
+            HttpResponse::InternalServerError().body("Failed to store OTP")
+        }
     }
-    id
+    
+    
 }
 
-fn get_otp(phone_no: &str) -> String {
-    let entries = OTP_ENTRIES.lock().unwrap();
-    entries.get(phone_no).cloned().unwrap_or_default()
-}
-
-fn main() {
-    generate_otp("+919833010430");
-    generate_otp("+919876543210");
-    let otp = get_otp("+919833010430");
-    println!("OTP for +919833010430: {:?}", otp);
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    env_logger::init_from_env(Env::default().default_filter_or("info"));
+    println!("🔍 Current working directory: {:?}", env::current_dir()?);
+    println!("✅ Starting Actix server on port 8080...");
+    let redis_url = env::var("REDIS_URL").unwrap_or("redis://127.0.0.1/".to_string());
+    let redis_pool = init_redis_pool(&redis_url).await;
+    
+    match HttpServer::new(move || {
+        println!("📦 Creating new App instance");
+        App::new()
+            .wrap(Logger::default())
+            .app_data(web::Data::new(redis_pool.clone()))
+            .service(hello)
+            .service(get_otp)
+    })
+    .bind(("0.0.0.0", 8080)) {
+        Ok(server) => {
+            println!("🚀 Server bound successfully to 0.0.0.0:8080");
+            server.workers(2).run().await
+        },
+        Err(e) => {
+            eprintln!("❌ Failed to bind server: {}", e);
+            Err(e)
+        }
+    }
 }
